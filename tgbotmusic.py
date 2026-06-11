@@ -24,8 +24,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("LoadIt_X")
 
 # === КОНФИГУРАЦИЯ ===
-BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
-ADMIN_ID = 5192928148
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения")
+
+ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "5192928148"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
