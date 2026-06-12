@@ -7,6 +7,7 @@ import logging
 import re
 import urllib.request
 import urllib.parse
+from PIL import Image
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import (
@@ -24,8 +25,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("LoadIt_X")
 
 # === КОНФИГУРАЦИЯ ===
-BOT_TOKEN = os.getenv("BOT_API_TOKEN")
-ADMIN_ID = 5192928148
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения")
+
+ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "5192928148"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -73,6 +77,10 @@ def get_short_id(text):
 
 # === ЛОГИКА ЗАГРУЗКИ И ОБРАБОТКИ ===
 def embed_metadata(mp3_path, cover_path, title, artist):
+    # Без ffmpeg мы не всегда получаем mp3. ID3-метаданные можно безопасно
+    # вшивать только в mp3, для m4a/webm/opus просто отправляем thumbnail в Telegram.
+    if not str(mp3_path).lower().endswith('.mp3'):
+        return
     try:
         audio = MP3(mp3_path, ID3=ID3)
         try: audio.add_tags()
@@ -88,17 +96,83 @@ def embed_metadata(mp3_path, cover_path, title, artist):
     except Exception as e:
         logger.error(f"Metadata error: {e}")
 
+def get_best_thumbnail_url(info):
+    urls = []
+    if info.get('thumbnail'):
+        urls.append(info.get('thumbnail'))
+    for t in info.get('thumbnails') or []:
+        if isinstance(t, dict) and t.get('url'):
+            urls.append(t.get('url'))
+
+    # Берём самый крупный/последний URL, SoundCloud часто отдаёт mini/large/t500x500.
+    url = urls[-1] if urls else None
+    if not url:
+        return None
+
+    # Улучшаем качество SoundCloud artwork, если URL в типичном формате sndcdn.
+    replacements = ['-mini.', '-small.', '-t67x67.', '-large.', '-t300x300.']
+    for marker in replacements:
+        if marker in url:
+            url = url.replace(marker, '-t500x500.')
+            break
+    return url
+
+def download_cover_jpg(info, filename):
+    url = get_best_thumbnail_url(info)
+    if not url:
+        return None
+
+    cover_path = f"{filename}.jpg"
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Referer': 'https://soundcloud.com/'
+        })
+        with urllib.request.urlopen(req, timeout=15) as response:
+            image_data = response.read()
+
+        tmp_path = f"{filename}_cover_src"
+        with open(tmp_path, 'wb') as f:
+            f.write(image_data)
+
+        with Image.open(tmp_path) as img:
+            img = img.convert('RGB')
+            img.thumbnail((320, 320))
+            canvas = Image.new('RGB', (320, 320), (0, 0, 0))
+            x = (320 - img.width) // 2
+            y = (320 - img.height) // 2
+            canvas.paste(img, (x, y))
+
+            # Telegram thumbnail должен быть маленьким. Снижаем качество, если файл > 190 KB.
+            quality = 90
+            while quality >= 55:
+                canvas.save(cover_path, 'JPEG', quality=quality, optimize=True)
+                if os.path.getsize(cover_path) <= 190 * 1024:
+                    break
+                quality -= 10
+
+        try: os.remove(tmp_path)
+        except: pass
+
+        return cover_path if os.path.exists(cover_path) else None
+    except Exception as e:
+        logger.error(f"Cover download error: {e}")
+        return None
+
 async def download_track(query, filename):
     loop = asyncio.get_event_loop()
     is_url = bool(re.search(r'https?://', query))
     search_query = query if is_url else f"scsearch1:{query}"
-    
+
+    # Версия без ffmpeg: скачиваем готовый аудиофайл и отправляем его как есть.
+    # Это нужно для хостингов, где нельзя поставить системный ffmpeg.
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': f'{filename}.%(ext)s',
         'noplaylist': True,
         'quiet': True,
-        'writethumbnail': True,
+        'writethumbnail': False,
         'no_warnings': True,
         'default_search': 'scsearch',
         'http_headers': {
@@ -107,34 +181,33 @@ async def download_track(query, filename):
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
         }
     }
-    
+
     def _extract():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(search_query, download=True)
             return info['entries'][0] if 'entries' in info else info
 
     info = await loop.run_in_executor(None, _extract)
-    raw_file = next((f for f in os.listdir() if f.startswith(filename) and not f.endswith(('.mp3', '.jpg', '.webp', '.png'))), None)
-    
-    if not raw_file:
-        raise Exception("Файл не найден после загрузки")
 
-    mp3_file, cover_file = f"{filename}.mp3", f"{filename}.jpg"
-    
-    found_cover = False
-    for ext in ['webp', 'png', 'jpg', 'jpeg']:
-        if os.path.exists(f"{filename}.{ext}"):
-            os.system(f'ffmpeg -y -i "{filename}.{ext}" -vf "scale=500:500:force_original_aspect_ratio=decrease,pad=500:500:(ow-iw)/2:(oh-ih)/2" "{cover_file}"')
-            found_cover = True
-            break
-    
-    os.system(f'ffmpeg -y -i "{raw_file}" -ab 192k "{mp3_file}"')
-    
+    # Берём любой скачанный аудиофайл. Не конвертируем в mp3, потому что ffmpeg на хостинге нет.
+    audio_exts = ('.m4a', '.mp3', '.webm', '.opus', '.ogg', '.aac', '.mp4')
+    audio_file = next((f for f in os.listdir() if f.startswith(filename) and f.lower().endswith(audio_exts)), None)
+
+    if not audio_file:
+        candidates = [f for f in os.listdir() if f.startswith(filename)]
+        raise Exception(f"Файл не найден после загрузки. Найдено: {candidates}")
+
     title = info.get('title', 'Unknown')
     artist = info.get('uploader') or info.get('user', {}).get('username') or 'SoundCloud'
-    
-    embed_metadata(mp3_file, cover_file if found_cover else None, title, artist)
-    return info, mp3_file, (cover_file if found_cover else None), title, artist
+
+    # Обложку делаем без ffmpeg: скачиваем artwork и пережимаем в JPG через Pillow.
+    cover_file = download_cover_jpg(info, filename)
+
+    # Если повезло и источник уже mp3 — вшиваем ID3-метаданные/обложку без ffmpeg.
+    # Если это m4a/webm/opus — Telegram всё равно получит thumbnail отдельным параметром.
+    embed_metadata(audio_file, cover_file, title, artist)
+
+    return info, audio_file, cover_file, title, artist
 
 async def download_and_send_single(inline_id, query, user_id, chat_id=None, wait_msg=None, is_album_part=False):
     safe_id = get_short_id(str(inline_id) + str(query) + str(datetime.now().timestamp()))
