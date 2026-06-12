@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("LoadIt_X")
 
 # === КОНФИГУРАЦИЯ ===
-BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = "BOT_API_TOKEN"
 ADMIN_ID = 5192928148
 
 bot = Bot(token=BOT_TOKEN)
